@@ -91,14 +91,25 @@ def main():
     tokenizer.load_seed_vocabulary(candidate_counts)
     print(f"Seed vocab size: {len(tokenizer.vocab):,}")
 
-    print(f"\nTraining with iterative pruning to {TARGET_VOCAB} tokens ...")
-    t0 = time.time()
-    tokenizer.train_prune_bytes(
-        lines,
-        target_vocab_size=TARGET_VOCAB,
-        prune_factor=PRUNE_FACTOR,
-        em_steps_per_iter=2,
-    )
+    from mingram_pp import _C_AVAILABLE
+    if _C_AVAILABLE:
+        print(f"\nTraining with C-accelerated Viterbi to {TARGET_VOCAB} tokens ...")
+        t0 = time.time()
+        tokenizer.train_prune_bytes_c(
+            lines,
+            target_vocab_size=TARGET_VOCAB,
+            prune_factor=PRUNE_FACTOR,
+            em_steps_per_iter=2,
+        )
+    else:
+        print(f"\nC extension not available, using Python fallback ...")
+        t0 = time.time()
+        tokenizer.train_prune_bytes(
+            lines,
+            target_vocab_size=TARGET_VOCAB,
+            prune_factor=PRUNE_FACTOR,
+            em_steps_per_iter=2,
+        )
     elapsed = time.time() - t0
     print(f"Training completed in {elapsed:.1f}s")
 

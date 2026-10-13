@@ -14,8 +14,77 @@ Two tokenizers are provided:
 
 import math
 import re
+import os
 import collections
 from typing import Dict, List, Optional, Set, Tuple
+
+# =====================================================================
+# C EXTENSION (ctypes)
+# =====================================================================
+
+_C_LIB = None
+_C_AVAILABLE = False
+
+def _load_c_lib():
+    global _C_LIB, _C_AVAILABLE
+    if _C_LIB is not None:
+        return
+    so_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mingram_c.so")
+    if not os.path.exists(so_path):
+        return
+    try:
+        import ctypes
+        lib = ctypes.CDLL(so_path)
+
+        # trie_build
+        lib.trie_build.restype = ctypes.c_int
+        lib.trie_build.argtypes = [
+            ctypes.c_char_p,                    # tokens_flat
+            ctypes.POINTER(ctypes.c_int),       # token_offsets
+            ctypes.c_int,                       # num_tokens
+            ctypes.POINTER(ctypes.c_int32),     # matrix_out
+            ctypes.POINTER(ctypes.c_uint8),     # is_terminal_out
+            ctypes.c_int,                       # max_states
+            ctypes.POINTER(ctypes.c_int),       # num_states_out
+        ]
+
+        # viterbi_tokenize
+        lib.viterbi_tokenize.restype = ctypes.c_int
+        lib.viterbi_tokenize.argtypes = [
+            ctypes.c_char_p,                    # byte_seq
+            ctypes.c_int,                       # seq_len
+            ctypes.POINTER(ctypes.c_int32),     # matrix
+            ctypes.POINTER(ctypes.c_uint8),     # is_terminal
+            ctypes.c_int,                       # num_states
+            ctypes.POINTER(ctypes.c_float),     # vocab_scores
+            ctypes.POINTER(ctypes.c_int),       # terminal_token_id
+            ctypes.POINTER(ctypes.c_int),       # tokens_out
+            ctypes.c_int,                       # max_tokens
+            ctypes.POINTER(ctypes.c_int),       # num_tokens_out
+        ]
+
+        # viterbi_batch_count
+        lib.viterbi_batch_count.restype = ctypes.c_int
+        lib.viterbi_batch_count.argtypes = [
+            ctypes.c_char_p,                    # chunks_flat
+            ctypes.POINTER(ctypes.c_int),       # chunk_offsets
+            ctypes.c_int,                       # num_chunks
+            ctypes.POINTER(ctypes.c_int32),     # matrix
+            ctypes.POINTER(ctypes.c_uint8),     # is_terminal
+            ctypes.c_int,                       # num_states
+            ctypes.POINTER(ctypes.c_float),     # vocab_scores
+            ctypes.POINTER(ctypes.c_int),       # terminal_token_id
+            ctypes.POINTER(ctypes.c_int),       # token_counts_out
+            ctypes.c_int,                       # vocab_size
+            ctypes.POINTER(ctypes.c_int),       # total_tokens_out
+        ]
+
+        _C_LIB = lib
+        _C_AVAILABLE = True
+    except Exception:
+        pass
+
+_load_c_lib()
 
 # =====================================================================
 # SUFFIX ARRAY SEED GENERATION
@@ -814,4 +883,205 @@ class ByteMinGramPPTokenizer:
             print(f" Pruned {num_to_drop} byte tokens. Current Size: {len(self.vocab)}")
 
         self.fit_em_step_bytes(corpus_sequences)
+        print(f"Training Complete! Final Clean Matrix Size: {len(self.vocab)}")
+
+    # ------------------------------------------------------------------
+    # C-accelerated Viterbi (via ctypes)
+    # ------------------------------------------------------------------
+
+    def _build_c_trie(self):
+        """Build the C trie and supporting arrays for accelerated tokenization."""
+        import ctypes
+        if not _C_AVAILABLE:
+            return False
+
+        tokens = self.id_to_token
+        n = len(tokens)
+        if n == 0:
+            return False
+
+        # Flatten tokens into a single byte buffer
+        all_bytes = b"".join(tokens)
+        offsets = [0]
+        for t in tokens:
+            offsets.append(offsets[-1] + len(t))
+
+        max_states = len(all_bytes) * 2 + 256
+        matrix = (ctypes.c_int32 * (max_states * 256))()
+        is_terminal = (ctypes.c_uint8 * max_states)()
+        num_states = ctypes.c_int(0)
+
+        rc = _C_LIB.trie_build(
+            all_bytes,
+            (ctypes.c_int * len(offsets))(*offsets),
+            n,
+            matrix,
+            is_terminal,
+            max_states,
+            ctypes.byref(num_states),
+        )
+        if rc != 0:
+            return False
+
+        self._c_matrix = matrix
+        self._c_is_terminal = is_terminal
+        self._c_num_states = num_states.value
+        self._c_num_tokens = n
+
+        # Build terminal_token_id: for each state, the token id if terminal
+        # We need to walk each token through the trie to find its terminal state
+        terminal_ids = [-1] * self._c_num_states
+        for tid, token in enumerate(tokens):
+            state = 0
+            for b in token:
+                state = matrix[state * 256 + b]
+            if is_terminal[state]:
+                terminal_ids[state] = tid
+        self._c_terminal_ids = (ctypes.c_int * self._c_num_states)(*terminal_ids)
+
+        # Vocab scores array (float, indexed by token id)
+        scores = [self.vocab.get(t, float("-inf")) for t in tokens]
+        self._c_scores = (ctypes.c_float * n)(*scores)
+
+        return True
+
+    def _tokenize_byte_chunk_c(self, chunk_bytes: bytes) -> List[bytes]:
+        """C-accelerated Viterbi decoder for a single byte chunk."""
+        import ctypes
+        n = len(chunk_bytes)
+        if n == 0:
+            return []
+
+        max_tok = n + 1
+        tokens_out = (ctypes.c_int * (max_tok * 2))()
+        num_tok = ctypes.c_int(0)
+
+        rc = _C_LIB.viterbi_tokenize(
+            chunk_bytes,
+            n,
+            self._c_matrix,
+            self._c_is_terminal,
+            self._c_num_states,
+            self._c_scores,
+            self._c_terminal_ids,
+            tokens_out,
+            max_tok,
+            ctypes.byref(num_tok),
+        )
+        if rc != 0:
+            return self._tokenize_byte_chunk(chunk_bytes)
+
+        result = []
+        for i in range(num_tok.value):
+            start = tokens_out[i * 2]
+            length = tokens_out[i * 2 + 1]
+            result.append(chunk_bytes[start : start + length])
+        return result
+
+    def fit_em_step_bytes_c(self, corpus_sequences: List[str]) -> None:
+        """C-accelerated Hard-EM step for the byte-level tokenizer.
+
+        Uses viterbi_batch_count to tokenize and count tokens entirely
+        in C, avoiding Python loop overhead in the hot path.
+        """
+        import ctypes
+        if not _C_AVAILABLE or not self._build_c_trie():
+            return self.fit_em_step_bytes(corpus_sequences)
+
+        # Pre-tokenize: split all sequences into chunks and flatten
+        chunks = []
+        for text in corpus_sequences:
+            for chunk in re.findall(r"\s*\w+|\s+|[^\w\s]", text):
+                chunks.append(chunk.encode("utf-8"))
+
+        chunks_flat = b"".join(chunks)
+        offsets = [0]
+        for c in chunks:
+            offsets.append(offsets[-1] + len(c))
+
+        vocab_size = self._c_num_tokens
+        counts_out = (ctypes.c_int * vocab_size)()
+        total_out = ctypes.c_int(0)
+
+        rc = _C_LIB.viterbi_batch_count(
+            chunks_flat,
+            (ctypes.c_int * len(offsets))(*offsets),
+            len(chunks),
+            self._c_matrix,
+            self._c_is_terminal,
+            self._c_num_states,
+            self._c_scores,
+            self._c_terminal_ids,
+            counts_out,
+            vocab_size,
+            ctypes.byref(total_out),
+        )
+        if rc != 0:
+            return self.fit_em_step_bytes(corpus_sequences)
+
+        # Rebuild vocabulary from counts
+        tokens = self.id_to_token
+        total_count = total_out.value + len(self.atomics)
+        new_vocab: Dict[bytes, float] = {}
+
+        for tid, token in enumerate(tokens):
+            count = counts_out[tid]
+            if token in self.atomics and count == 0:
+                count = 1
+            if count > 0:
+                new_vocab[token] = math.log(count / total_count)
+            else:
+                new_vocab[token] = float("-inf")
+
+        self.vocab = new_vocab
+        self.id_to_token = sorted(self.vocab.keys())
+        self.token_to_id = {t: i for i, t in enumerate(self.id_to_token)}
+        self.flat_trie = None
+
+    def train_prune_bytes_c(
+        self,
+        corpus_sequences: List[str],
+        target_vocab_size: int,
+        prune_factor: float = 0.2,
+        em_steps_per_iter: int = 2,
+    ) -> None:
+        """C-accelerated iterative pruning for byte vocabulary."""
+        print(
+            f"Starting Byte Training (C-accelerated). "
+            f"Initial Vocabulary Candidates: {len(self.vocab)}"
+        )
+
+        while len(self.vocab) > target_vocab_size:
+            for _ in range(em_steps_per_iter):
+                self.fit_em_step_bytes_c(corpus_sequences)
+
+            current_size = len(self.vocab)
+            num_to_drop = int(current_size * prune_factor)
+
+            if current_size - num_to_drop < target_vocab_size:
+                num_to_drop = current_size - target_vocab_size
+
+            if num_to_drop <= 0:
+                break
+
+            non_atomic_tokens = [
+                t for t in self.vocab.keys() if t not in self.atomics
+            ]
+            non_atomic_tokens.sort(key=lambda t: self.vocab[t])  # type: ignore[arg-type]
+
+            tokens_to_evict = set(non_atomic_tokens[:num_to_drop])
+
+            pruned_vocab: Dict[bytes, float] = {}
+            for token, score in self.vocab.items():
+                if token not in tokens_to_evict:
+                    pruned_vocab[token] = score
+
+            self.vocab = pruned_vocab
+            self.id_to_token = sorted(self.vocab.keys())
+            self.token_to_id = {t: i for i, t in enumerate(self.id_to_token)}
+            self.flat_trie = None
+
+            print(f" Pruned {num_to_drop} byte tokens. Current Size: {len(self.vocab)}")
+
+        self.fit_em_step_bytes_c(corpus_sequences)
         print(f"Training Complete! Final Clean Matrix Size: {len(self.vocab)}")
