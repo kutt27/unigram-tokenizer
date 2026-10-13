@@ -10,7 +10,7 @@ import sentencepiece as spm
 import os
 import sys
 
-from mingram_pp import ByteMinGramPPTokenizer
+from mingram_pp import ByteMinGramPPTokenizer, mine_candidates_suffix_array
 
 CORPUS_URL = "https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/valid.txt"
 CORPUS_PATH = "/tmp/wikitext2_valid.txt"
@@ -76,22 +76,15 @@ def profile_sp(sp, lines: list[str]) -> dict:
 # ── MinGram-PP ─────────────────────────────────────────────────────
 
 def train_mingram(lines: list[str], vocab_size: int) -> ByteMinGramPPTokenizer:
-    import collections
     print(f"\n{'='*60}")
     print(f"Training ByteMinGramPPTokenizer (vocab={vocab_size})")
     print(f"{'='*60}")
 
-    print("Mining byte substrings ...")
-    counts: dict[bytes, int] = collections.Counter()
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        b = stripped.encode("utf-8")
-        for start in range(len(b)):
-            for end in range(start + 2, min(start + 13, len(b) + 1)):
-                counts[b[start:end]] += 1
-    print(f"  {len(counts):,} unique candidates")
+    print("Mining byte substrings (suffix array) ...")
+    t0 = time.time()
+    counts = mine_candidates_suffix_array(lines, max_len=12, min_count=2)
+    mine_time = time.time() - t0
+    print(f"  {len(counts):,} unique candidates in {mine_time:.1f}s")
 
     tok = ByteMinGramPPTokenizer()
     tok.load_seed_vocabulary(counts)

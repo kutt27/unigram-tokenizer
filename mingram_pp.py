@@ -18,6 +18,210 @@ import collections
 from typing import Dict, List, Optional, Set, Tuple
 
 # =====================================================================
+# SUFFIX ARRAY SEED GENERATION
+# =====================================================================
+
+
+def _build_suffix_array(data: bytes) -> List[int]:
+    """Build suffix array for *data* using the SA-IS algorithm (O(n))."""
+    n = len(data)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    # Convert to integer alphabet [1..256], 0 is sentinel
+    s = [b + 1 for b in data] + [0]
+    n1 = len(s)
+
+    # SA-IS implementation
+    alphabet = max(s) + 1
+    SA = [-1] * n1
+
+    def _classify(s, n):
+        """Return boolean list: True if S-type, False if L-type."""
+        t = [False] * n
+        t[n - 1] = True
+        for i in range(n - 2, -1, -1):
+            t[i] = s[i] < s[i + 1] or (s[i] == s[i + 1] and t[i + 1])
+        return t
+
+    def _sort_lms(s, t, n, alphabet):
+        """Sort LMS substrings using bucket sort."""
+        sa = [-1] * n
+        # Bucket boundaries
+        c = [0] * alphabet
+        for ch in s:
+            c[ch] += 1
+        bucket_s = [0] * alphabet
+        bucket_e = [0] * alphabet
+        bucket_s[0] = 0
+        for i in range(1, alphabet):
+            bucket_s[i] = bucket_s[i - 1] + c[i - 1]
+        for i in range(alphabet):
+            bucket_e[i] = bucket_s[i] + c[i]
+
+        # Place LMS suffixes at end of buckets
+        lms = []
+        for i in range(1, n):
+            if t[i] and not t[i - 1]:  # LMS position
+                lms.append(i)
+
+        for i in reversed(lms):
+            ch = s[i]
+            bucket_e[ch] -= 1
+            sa[bucket_e[ch]] = i
+
+        # Induce L-type
+        for i in range(n):
+            if sa[i] > 0 and not t[sa[i] - 1]:
+                ch = s[sa[i] - 1]
+                sa[bucket_s[ch]] = sa[i] - 1
+                bucket_s[ch] += 1
+
+        # Induce S-type
+        for i in range(n - 1, -1, -1):
+            if sa[i] > 0 and t[sa[i] - 1]:
+                ch = s[sa[i] - 1]
+                bucket_e[ch] -= 1
+                sa[bucket_e[ch]] = sa[i] - 1
+
+        return sa, lms
+
+    def _sais(s, n, alphabet):
+        t = _classify(s, n)
+        sa, lms = _sort_lms(s, t, n, alphabet)
+        if not lms:
+            return sa
+
+        # Name LMS substrings
+        lms_map = [-1] * n
+        k = 0
+        for i in range(n):
+            if sa[i] > 0 and t[sa[i]] and not t[sa[i] - 1]:
+                lms_map[sa[i]] = k
+                k += 1
+
+        # Build reduced string
+        lms_sorted = [sa[i] for i in range(n) if sa[i] > 0 and t[sa[i]] and not t[sa[i] - 1]]
+        s1 = []
+        for i in lms_sorted:
+            s1.append(lms_map[i])
+
+        # Recurse if not unique
+        if k < len(lms_sorted):
+            sa1 = _sais(s1, len(lms_sorted), k + 1)
+            lms_sorted = [lms_sorted[i] for i in sa1]
+
+        # Re-sort with known LMS order
+        sa = [-1] * n
+        c = [0] * alphabet
+        for ch in s:
+            c[ch] += 1
+        bucket_s = [0] * alphabet
+        bucket_e = [0] * alphabet
+        bucket_s[0] = 0
+        for i in range(1, alphabet):
+            bucket_s[i] = bucket_s[i - 1] + c[i - 1]
+        for i in range(alphabet):
+            bucket_e[i] = bucket_s[i] + c[i]
+
+        for i in reversed(lms_sorted):
+            ch = s[i]
+            bucket_e[ch] -= 1
+            sa[bucket_e[ch]] = i
+
+        for i in range(n):
+            if sa[i] > 0 and not t[sa[i] - 1]:
+                ch = s[sa[i] - 1]
+                sa[bucket_s[ch]] = sa[i] - 1
+                bucket_s[ch] += 1
+
+        for i in range(n - 1, -1, -1):
+            if sa[i] > 0 and t[sa[i] - 1]:
+                ch = s[sa[i] - 1]
+                bucket_e[ch] -= 1
+                sa[bucket_e[ch]] = sa[i] - 1
+
+        return sa
+
+    sa = _sais(s, n1, alphabet)
+    return sa[1:]  # Remove sentinel position
+
+
+def _build_lcp_array(data: bytes, sa: List[int]) -> List[int]:
+    """Build LCP array from suffix array using Kasai's algorithm (O(n))."""
+    n = len(sa)
+    rank = [0] * n
+    for i in range(n):
+        rank[sa[i]] = i
+    lcp = [0] * n
+    h = 0
+    for i in range(n):
+        r = rank[i]
+        if r > 0:
+            j = sa[r - 1]
+            while i + h < n and j + h < n and data[i + h] == data[j + h]:
+                h += 1
+            lcp[r] = h
+            if h > 0:
+                h -= 1
+    return lcp
+
+
+def mine_candidates_suffix_array(
+    lines: List[str], max_len: int = 12, min_count: int = 2
+) -> Dict[bytes, int]:
+    """Extract repeated byte substrings using a suffix array + LCP.
+
+    O(n log n) construction, O(n) candidate enumeration. Uses a
+    stack-based approach to efficiently group consecutive suffixes
+    sharing common prefixes without per-candidate scanning.
+    """
+    # Concatenate corpus with unique sentinel bytes between lines
+    sentinel = b"\x00"
+    chunks = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped:
+            chunks.append(stripped.encode("utf-8"))
+    corpus = sentinel.join(chunks)
+    n = len(corpus)
+
+    sa = _build_suffix_array(corpus)
+    lcp = _build_lcp_array(corpus, sa)
+
+    # Stack-based approach: process LCP array to find all maximal intervals
+    # where minimum LCP >= threshold. Each such interval of size k means
+    # the shared prefix appears at least k times.
+    counts: Dict[bytes, int] = collections.Counter()
+    visited: Set[Tuple[int, int]] = set()  # (start_pos, length)
+
+    # Process each LCP value; for each, find maximal group it defines
+    # Use a stack to efficiently track intervals
+    for length in range(2, max_len + 1):
+        # Find all maximal intervals in the LCP array where every value >= length
+        i = 1
+        while i < n:
+            if lcp[i] >= length:
+                # Start of a group
+                group_start = i - 1
+                while i < n and lcp[i] >= length:
+                    i += 1
+                group_end = i  # inclusive: suffixes sa[group_start..group_end]
+                group_size = group_end - group_start + 1
+                if group_size >= min_count:
+                    # Extract the shared substring from any suffix in the group
+                    pos = sa[group_start]
+                    sub = corpus[pos : pos + length]
+                    if sentinel not in sub:
+                        key = (pos, length)
+                        if key not in visited:
+                            visited.add(key)
+                            counts[sub] = group_size
+            i += 1
+
+    return counts
 # STRING-LEVEL TOKENIZER
 # =====================================================================
 

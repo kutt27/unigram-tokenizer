@@ -8,7 +8,7 @@ import urllib.request
 import collections
 import time
 import sys
-from mingram_pp import ByteMinGramPPTokenizer
+from mingram_pp import ByteMinGramPPTokenizer, mine_candidates_suffix_array
 
 CORPUS_URL = "https://raw.githubusercontent.com/pytorch/examples/main/word_language_model/data/wikitext-2/valid.txt"
 CORPUS_PATH = "/tmp/wikitext2_valid.txt"
@@ -64,11 +64,28 @@ def main():
     text = download_corpus(CORPUS_PATH)
     lines = text.splitlines()
 
-    print(f"\nMining byte substrings (max_len={MAX_SUBSTR_LEN}) ...")
-    t0 = time.time()
-    candidate_counts = mine_byte_candidates(lines)
-    print(f"Mining done in {time.time() - t0:.1f}s — {len(candidate_counts):,} unique candidates")
+    # --- Seed generation comparison ---
+    print(f"\n{'='*60}")
+    print(f"SEED GENERATION COMPARISON (max_len={MAX_SUBSTR_LEN})")
+    print(f"{'='*60}")
 
+    print(f"\n1. Brute-force substring mining ...")
+    t0 = time.time()
+    bf_counts = mine_byte_candidates(lines)
+    bf_time = time.time() - t0
+    print(f"   {bf_time:.1f}s — {len(bf_counts):,} unique candidates")
+
+    print(f"\n2. Suffix array extraction ...")
+    t0 = time.time()
+    sa_counts = mine_candidates_suffix_array(lines, max_len=MAX_SUBSTR_LEN, min_count=2)
+    sa_time = time.time() - t0
+    print(f"   {sa_time:.1f}s — {len(sa_counts):,} unique candidates")
+
+    speedup = bf_time / max(sa_time, 0.001)
+    print(f"\nSpeedup: {speedup:.1f}x")
+
+    # Use suffix array candidates for training
+    candidate_counts = sa_counts
     print(f"\nLoading seed vocabulary ...")
     tokenizer = ByteMinGramPPTokenizer()
     tokenizer.load_seed_vocabulary(candidate_counts)
