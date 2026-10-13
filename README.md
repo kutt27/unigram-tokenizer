@@ -47,3 +47,21 @@ Replace brute-force mining with a suffix array to extract all repeated substring
 
 This avoids the per-line quadratic scan entirely. SentencePiece uses this approach in C++ and extracts seed candidates from the same corpus in ~0.1s. A Python implementation using `pysuffix` or a custom SA would target the same algorithmic complexity, with the C extension handling the inner loop.
 
+### Implemented: SA-IS Suffix Array Results
+
+WikiText-2 validation set (1.1M bytes, vocab=8000)
+
+| Metric | Brute-Force | Suffix Array |
+|---|---|---|
+| Seed generation | 6.2s | 5.1s |
+| Unique candidates | 3,942,396 | 222,322 |
+| Total training | 547s | 89s |
+| Bytes/Token | 3.51 | 2.88 |
+
+- SA-IS construction: O(n) linear time with L-type/S-type classification and LMS sorting
+- LCP array via Kasai's algorithm: O(n) construction
+- Candidate enumeration: walks LCP intervals to find maximal groups sharing prefixes of length 2..max_len
+- SA extracts 17x fewer candidates due to min_count=2 filtering — only substrings appearing at least twice
+- Total training time reduced 6.2x (547s → 89s)
+- Compression quality slightly worse (2.88 vs 3.51 bytes/token) — smaller candidate pool gives EM less material to work with during pruning
+
