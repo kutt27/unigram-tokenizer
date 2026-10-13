@@ -65,3 +65,20 @@ WikiText-2 validation set (1.1M bytes, vocab=8000)
 - Total training time reduced 6.2x (547s → 89s)
 - Compression quality slightly worse (2.88 vs 3.51 bytes/token) — smaller candidate pool gives EM less material to work with during pruning
 
+### C Extension: Viterbi Decoder via ctypes
+
+Ported the FlatMatrixTrie construction and Viterbi byte-chunk decoder to C (`mingram_c.c`), loaded from Python via ctypes. The EM loop, pruning logic, and SA-IS seed generation remain in Python.
+
+WikiText-2 validation set (1.1M bytes, vocab=8000)
+
+| Version | Training Time | Bytes/Token |
+|---|---|---|
+| Pure Python (brute-force) | 547s | 3.51 |
+| Pure Python (suffix array) | 89s | 2.88 |
+| C-accelerated (suffix array) | 43s | 2.88 |
+
+- Total speedup: 12.7x (547s → 43s)
+- C handles the inner Viterbi loop: trie lookup, DP transitions, backtracking
+- Python handles: corpus preprocessing, EM count aggregation, vocabulary pruning
+- Compression quality unchanged — same algorithm, just faster execution
+
